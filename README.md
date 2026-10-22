@@ -42,17 +42,6 @@ sudo yum install -y jq
         └── <account>_CloudTrail_<region>_<timestamp>_<id>.json.gz
 ```
 
-## Repository layout
-
-```
-.
-├── README.md
-├── scripts/
-│   └── flatten.sh          # Flattens .json.gz to .ndjson
-└── splunk/
-    ├── props.conf          # aws:cloudtrail sourcetype
-```
-
 ## Quick start
 
 ### 1. Clean the raw data (optional but recommended)
