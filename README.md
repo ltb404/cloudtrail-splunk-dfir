@@ -75,7 +75,7 @@ find . -name '*.json.gz' ! -name '._*' -print0 \
   | xargs -0 zcat | wc -c | awk '{printf "%.1f GB\n", $1/1024/1024/1024}'
 ```
 
-Compare the result with your daily license quota (see [Licensing](#licensing)).
+Compare the result with your daily ingest license quota.
 
 ### 3. Flatten the files
 
@@ -137,27 +137,12 @@ Place these in `$SPLUNK_HOME/etc/system/local/` or in a custom app, then restart
 
 ### 6. Ingest
 
-**Option A: one-shot (keeps the flattened files)**
-
 ```bash
 find /data/cloudtrail_flat -type f -name '*.ndjson' | while read -r f; do
   $SPLUNK_HOME/bin/splunk add oneshot "$f" \
     -index aws_cloudtrail -sourcetype aws:cloudtrail
 done
 ```
-
-**Option B: batch input (deletes each file after indexing)**
-
-```ini
-# inputs.conf
-[batch:///data/cloudtrail_flat]
-move_policy = sinkhole
-index = aws_cloudtrail
-sourcetype = aws:cloudtrail
-recursive = true
-```
-
-> **Warning:** `sinkhole` deletes files after they are indexed. Only point it at the flattened copies and keep `/raw` as your backup.
 
 ## Licensing
 
