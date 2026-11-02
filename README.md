@@ -12,18 +12,6 @@ CloudTrail exports arrive as many `.tar.gz` / `.json.gz` files spread across `re
 2. **Configure**: apply the `aws:cloudtrail` sourcetype in `props.conf` so events get the correct timestamp and fields.
 3. **Load**: ingest the flattened files with Splunk's one-shot input, in batches that respect your license quota.
 
-## Repository layout
-
-```
-.
-├── README.md
-├── scripts/
-│   ├── flatten.sh      # extracts archives and flattens files to NDJSON
-│   └── oneshot.sh      # loads the flattened files into Splunk
-└── splunk/
-    └── props.conf      # aws:cloudtrail sourcetype settings
-```
-
 ## Prerequisites
 
 - Linux host with `bash`, `find`, `xargs`, `tar`, `zcat`
