@@ -1,156 +1,130 @@
 # cloudtrail-to-splunk
 
-Scripts and configuration to bulk-load exported AWS CloudTrail logs (`.json.gz`) into **Splunk Enterprise** for analysis.
+Scripts and configuration to bulk-load exported AWS CloudTrail logs into **Splunk Enterprise**.
 
-CloudTrail log files wrap all events in a single `{"Records":[ ... ]}` object. Splunk would index each file as one giant event, so this package first flattens the files into newline-delimited JSON (one event per line), then ingests them with correct timestamp and field extraction settings.
+## The problem
 
-## Features
+CloudTrail exports arrive as many `.tar.gz` / `.json.gz` files spread across `region/year/month/day` folders. Each file wraps all of its events in a single `{"Records":[ ... ]}` object. Indexed as-is, Splunk treats each file as one giant event, so searches, field extraction and timestamps break.
 
-- Flattens CloudTrail `.json.gz` files to NDJSON, preserving the `region/year/month/day` directory structure
-- Parallel processing with `xargs -P`
-- Skips macOS metadata junk (`._*`, `.DS_Store`, `__MACOSX`)
-- Fails loudly: failed files are reported and partial output is removed
-- Ready-to-use `props.conf`, `indexes.conf` and `inputs.conf` examples
-- Guidance for staying within Splunk daily license limits
-- Verification searches and troubleshooting for common errors
+## The solution
+
+1. **Flatten**: extract the archives and convert every file to newline-delimited JSON (one event per line).
+2. **Configure**: apply the `aws:cloudtrail` sourcetype in `props.conf` so events get the correct timestamp and fields.
+3. **Load**: ingest the flattened files with Splunk's one-shot input, in batches that respect your license quota.
+
+## Repository layout
+
+```
+.
+├── README.md
+├── scripts/
+│   ├── flatten.sh      # extracts archives and flattens files to NDJSON
+│   └── oneshot.sh      # loads the flattened files into Splunk
+└── splunk/
+    └── props.conf      # aws:cloudtrail sourcetype settings
+```
 
 ## Prerequisites
 
-| Requirement | Notes |
+- Linux host with `bash`, `find`, `xargs`, `tar`, `zcat`
+- [`jq`](https://jqlang.github.io/jq/) (check with `command -v jq`)
+- Splunk Enterprise with admin access, installed on the same host
+- Free disk space roughly equal to the **uncompressed** size of your logs
+
+Install `jq` if missing:
+
+```bash
+sudo apt-get install -y jq    # Debian/Ubuntu
+sudo yum install -y jq        # RHEL/CentOS/Amazon Linux
+```
+
+## Usage
+
+### 1. Prepare Splunk
+
+Create the index:
+
+```bash
+$SPLUNK_HOME/bin/splunk add index aws_cloudtrail
+```
+
+Copy `splunk/props.conf` to `$SPLUNK_HOME/etc/system/local/` (or into a custom app's `local/` folder), then restart Splunk:
+
+```bash
+$SPLUNK_HOME/bin/splunk restart
+```
+
+Make sure the index's retention (`frozenTimePeriodInSecs`) is longer than the age of your data, otherwise events may expire right after indexing.
+
+### 2. Flatten the logs
+
+```bash
+./scripts/flatten.sh <source_dir> <dest_dir> [parallel_jobs]
+```
+
+Example:
+
+```bash
+./scripts/flatten.sh /raw /data/cloudtrail_flat 4
+```
+
+| Argument | Description |
 |---|---|
-| Linux host with shell access | Where the raw files and Splunk (or a staging area) live |
-| `bash`, `find`, `xargs`, `zcat` | Standard on most distributions |
-| [`jq`](https://jqlang.github.io/jq/) | **Required.** Check with `command -v jq` |
-| Splunk Enterprise with admin access | Needed to create an index and edit `.conf` files |
-| Free disk space | About the uncompressed size of your data for the flattened staging copy |
+| `source_dir` | Folder containing the exported `.tar.gz`, `.json.gz` or `.json` files |
+| `dest_dir` | Output folder for the flattened `.ndjson` files (folder structure is preserved) |
+| `parallel_jobs` | Optional. Number of parallel workers (default `4`) |
 
-Install `jq`:
+What it does:
 
-```bash
-# Debian/Ubuntu
-sudo apt-get install -y jq
-# RHEL/CentOS/Amazon Linux
-sudo yum install -y jq
-```
+- Extracts `.tar.gz` archives, then flattens all CloudTrail files
+- Skips macOS junk files (`._*`, `.DS_Store`)
+- Removes outputs that contain no events
+- Lists any failed files in `<dest_dir>_failed.log` and exits with code `2`
+- Cleans up its temporary extraction folder when everything succeeds
 
-## Expected input layout
+### 3. Check the volume against your license
 
-```
-/raw/
-└── <region>/
-    └── <year>/<month>/<day>/
-        └── <account>_CloudTrail_<region>_<timestamp>_<id>.json.gz
-```
-
-## Quick start
-
-### 1. Clean the raw data (optional but recommended)
-
-If the archive passed through macOS, remove AppleDouble files. They are about 160 bytes and cause `not in gzip format` errors.
+Splunk counts **uncompressed** bytes indexed per day. Check the flattened size first:
 
 ```bash
-cd /raw
-find . -name '._*' -delete
-find . \( -name '.DS_Store' -o -name '__MACOSX' \) -print
+du -sh /data/cloudtrail_flat
 ```
 
-### 2. Estimate the uncompressed size
+If it is larger than your daily quota, load in several runs using the size limit in the next step.
 
-Splunk licensing counts uncompressed volume, and `.gz` ratios vary (typically 10-15x for CloudTrail).
+### 4. Load into Splunk
 
 ```bash
-cd /raw
-find . -name '*.json.gz' ! -name '._*' -print0 \
-  | xargs -0 zcat | wc -c | awk '{printf "%.1f GB\n", $1/1024/1024/1024}'
+./scripts/oneshot.sh <ndjson_dir> [max_gb_per_run]
 ```
 
-Compare the result with your daily ingest license quota.
-
-### 3. Flatten the files
+Examples:
 
 ```bash
-mkdir -p /data/cloudtrail_flat
-cd /raw
-
-flatten() {
-  set -o pipefail
-  f="$1"
-  out="/data/cloudtrail_flat/${f#./}"
-  out="${out%.json.gz}.ndjson"
-  mkdir -p "$(dirname "$out")"
-  zcat "$f" | jq -c '.Records[]' > "$out" || { echo "FAILED: $f" >&2; rm -f "$out"; }
-}
-export -f flatten
-
-find . -type f -name '*.json.gz' ! -name '._*' -print0 \
-  | xargs -0 -P 4 -I{} bash -c 'flatten "$@"' _ {}
+./scripts/oneshot.sh /data/cloudtrail_flat        # load everything
+./scripts/oneshot.sh /data/cloudtrail_flat 40     # stop after ~40 GB, continue tomorrow
 ```
 
-Adjust `-P 4` to your CPU core count.
+| Setting | Description |
+|---|---|
+| `ndjson_dir` | Folder with the flattened `.ndjson` files |
+| `max_gb_per_run` | Optional. Stop after roughly this many GB so you stay under your daily quota |
 
-### 4. Verify the flattened output
+Environment variables (all optional):
 
-```bash
-# Source files vs. output files (counts should match, except genuinely empty files)
-find /raw -type f -name '*.json.gz' ! -name '._*' | wc -l
-find /data/cloudtrail_flat -type f -name '*.ndjson' -size +0 | wc -l
+| Variable | Default | Purpose |
+|---|---|---|
+| `SPLUNK_HOME` | `/opt/splunk` | Splunk install path |
+| `INDEX` | `aws_cloudtrail` | Target index |
+| `SOURCETYPE` | `aws:cloudtrail` | Sourcetype |
+| `DONE_LOG` | `./oneshot_done.log` | Tracks loaded files so re-runs skip them |
+| `SPLUNK_AUTH` | none | `user:password`, if you are not logged in via `splunk login` |
 
-# Empty outputs
-find /data/cloudtrail_flat -type f -empty | wc -l
+Re-running the script is safe: files already listed in the done log are skipped.
 
-# Each line should be one complete JSON event
-head -n 2 "$(find /data/cloudtrail_flat -name '*.ndjson' -size +0 | head -1)"
-```
+### 5. Verify
 
-A few empty outputs can be legitimate: CloudTrail occasionally writes files containing `"Records":[]`. A large number points to a problem.
-
-### 5. Configure Splunk
-
-Create an index for your data.
-
-**`props.conf`**
-
-```ini
-[aws:cloudtrail]
-SHOULD_LINEMERGE = false
-LINE_BREAKER = ([\r\n]+)
-TIME_PREFIX = "eventTime":\s*"
-TIME_FORMAT = %Y-%m-%dT%H:%M:%SZ
-MAX_TIMESTAMP_LOOKAHEAD = 25
-TZ = UTC
-KV_MODE = json
-TRUNCATE = 0
-```
-
-Place these in `$SPLUNK_HOME/etc/system/local/` or in a custom app, then restart Splunk.
-
-### 6. Ingest
-
-```bash
-find /data/cloudtrail_flat -type f -name '*.ndjson' | while read -r f; do
-  $SPLUNK_HOME/bin/splunk add oneshot "$f" \
-    -index aws_cloudtrail -sourcetype aws:cloudtrail
-done
-```
-
-## Licensing
-
-Splunk counts the uncompressed bytes indexed per day. A one-day load larger than your quota causes a license warning, and repeated warnings can restrict search depending on your license type.
-
-Ways to stay under the limit:
-
-- Load one region (or one week or month) per day by staging subsets of files into the ingest directory
-- Load part of the data before midnight and the rest after it (the license day resets at midnight in the license manager's time zone)
-
-Monitor today's usage:
-
-```spl
-index=_internal source=*license_usage.log type=Usage earliest=-1d
-| stats sum(b) as bytes
-| eval GB=round(bytes/1024/1024/1024,2)
-```
-
-## Verifying the load in Splunk
+Run these searches in Splunk:
 
 ```spl
 index=aws_cloudtrail | stats count by awsRegion
@@ -158,27 +132,38 @@ index=aws_cloudtrail | timechart span=1d count
 index=aws_cloudtrail | stats min(_time) as first max(_time) as last | convert ctime(first) ctime(last)
 ```
 
-Check that the date range matches your export and that fields such as `eventName`, `userIdentity.arn` and `sourceIPAddress` are extracted.
+Confirm the date range matches your export and that fields such as `eventName`, `userIdentity.arn` and `sourceIPAddress` are extracted.
+
+To monitor license usage while loading:
+
+```spl
+index=_internal source=*license_usage.log type=Usage earliest=-1d
+| stats sum(b) as bytes
+| eval GB=round(bytes/1024/1024/1024,2)
+```
 
 ## Troubleshooting
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `gzip: ./._...json.gz: not in gzip format` | macOS AppleDouble metadata file (about 160 bytes) | Delete `._*` files or exclude them with `! -name '._*'` |
-| `jq: command not found` | `jq` is not installed | Install `jq` (see [Prerequisites](#prerequisites)), delete empty outputs with `find /data/cloudtrail_flat -type f -empty -delete`, then rerun |
-| Events appear at the wrong time | Timestamp taken from the wrong field | Confirm `TIME_PREFIX` in `props.conf` and that the sourcetype is `aws:cloudtrail` |
-| Events cut off | Default line truncation | Set `TRUNCATE = 0` |
-| Whole file shows as one event | Files not flattened, or `LINE_BREAKER` missing | Flatten first and check `head -n 2` of the output |
-| Data disappears shortly after indexing | Index retention shorter than the data's age | Increase `frozenTimePeriodInSecs` |
-| `FAILED: <file>` for a real file | Truncated or corrupt archive | Test with `gzip -t <file>` and re-export that file |
+| `gzip: ._...json.gz: not in gzip format` | macOS metadata file (about 160 bytes) | `flatten.sh` skips these; you can also delete them with `find . -name '._*' -delete` |
+| `jq: command not found` | `jq` is not installed | Install `jq`, delete empty outputs (`find <dest_dir> -type f -empty -delete`), rerun |
+| Failures listed in `<dest_dir>_failed.log` | Truncated or corrupt archive | Test with `gzip -t <file>` or `tar -tzf <file>` and re-export it |
+| Events show the wrong time | Sourcetype not applied | Check `props.conf` is installed, Splunk was restarted, and the sourcetype is `aws:cloudtrail` |
+| Whole file appears as one event | Files were not flattened | Run `flatten.sh` first and check with `head -n 2` on an output file |
+| Data disappears after indexing | Index retention too short | Increase `frozenTimePeriodInSecs` for the index |
+| `oneshot.sh` asks for credentials or fails to authenticate | Not logged in to Splunk CLI | Run `splunk login` or set `SPLUNK_AUTH` |
 
-## Optional: Splunk Add-on for AWS
+## Notes
 
-The [Splunk Add-on for AWS](https://splunkbase.splunk.com/app/1876) provides CIM field mappings and knowledge objects for `aws:cloudtrail`, which is useful for Enterprise Security or the AWS app. Its inputs read from S3/SQS rather than local files, so for local exports keep using the flattening workflow above and install the add-on only for its knowledge objects.
+- `oneshot.sh` uses Linux `stat -c`, so it is not compatible with macOS.
+- If the scripts are not executable after cloning, run `chmod +x scripts/*.sh` or call them with `bash scripts/<name>.sh`.
+- Keep your original export as a backup; the scripts never modify the source folder.
+- Optional: the [Splunk Add-on for AWS](https://splunkbase.splunk.com/app/1876) adds CIM field mappings for `aws:cloudtrail`. Its own inputs read from S3/SQS, so for local exports keep using this workflow.
 
 ## Contributing
 
-Issues and pull requests are welcome. Please test changes against a small sample before submitting.
+Issues and pull requests are welcome. Please test changes on a small sample before submitting.
 
 ## Disclaimer
 
